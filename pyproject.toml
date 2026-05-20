@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "weread-tui"
+version = "0.1.0"
+description = "macOS 终端微信读书阅读器"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["weread", "tui", "terminal", "reading"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "textual>=0.60.0",
+    "httpx>=0.27.0",
+    "click>=8.1.0",
+    "beautifulsoup4>=4.12",
+    "keyring>=25.0.0",
+    "qrcode>=7.4.0",
+]
+
+[project.scripts]
+weread = "weread.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+browser = [
+    "playwright>=1.40.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["weread"]
