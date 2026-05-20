@@ -5,6 +5,12 @@
 
 ---
 
+## 语言要求
+
+**所有回复必须使用中文。** 无论用户使用何种语言提问，AI 助手均应以中文作答。
+
+---
+
 ## 项目核心约束
 
 - **Python ≥ 3.11**，主要目标平台 macOS，Linux 友好但不保证，不支持 Windows
@@ -25,8 +31,8 @@ weread-tui/
     ├── __main__.py            ← python -m weread 入口
     ├── cli.py                 ← click 命令：weread / weread login / weread logout
     ├── auth.py                ← 登录与 Cookie 管理（keyring 存 macOS Keychain）
-    ├── api.py                 ← httpx.AsyncClient 封装所有 API 请求
-    ├── browser.py             ← Playwright headless Chromium 三级 fallback
+    ├── api.py                 ← 书架/目录 API 封装 + 章节正文调度
+    ├── browser.py             ← Playwright headless Chromium 章节正文主链路
     ├── parser.py              ← BeautifulSoup HTML → Textual Rich Markup
     ├── state.py               ← ~/.config/weread-tui/state.json 持久化
     └── tui/
@@ -49,6 +55,7 @@ dependencies = [
     "beautifulsoup4>=4.12", # HTML 解析
     "keyring>=25.0.0",      # Cookie 存系统钥匙串
     "qrcode>=7.4.0",        # 终端渲染二维码（登录用）
+    "playwright>=1.40.0",   # 章节正文主链路
 ]
 
 [project.scripts]
@@ -76,7 +83,7 @@ headers = {
 | `GET /web/shelf/sync?synckey=0&teenmode=0&albumTypes=1&crossDeviceSync=1` | 书架 + 阅读进度 + 分组 |
 | `GET /web/book/info?bookId={bookId}` | 书籍元信息 |
 | `GET /web/book/chapterInfos?bookIds={bookId}&synckeys=0` | 章节列表 |
-| `GET /web/book/chapter/e3?bookId={bookId}&chapterUid={uid}` | 章节正文（HTML） |
+| Playwright `/web/reader/{bookKey}?chapterUid={uid}` | 章节正文（前端解密后 DOM 提取） |
 
 **Cookie 过期判断**：响应体含 `{"errCode": -2012}` 或 HTTP 401 → 触发重新登录提示。
 
@@ -183,6 +190,12 @@ pipx install weread-tui
 ```
 
 > **注意**：系统自带 pip 可能是 Python 2，务必使用 `python3` 或虚拟环境内的 pip。
+
+首次运行前需安装浏览器内核：
+
+```bash
+.venv/bin/playwright install chromium
+```
 
 完整规格见 [SPEC.md](./SPEC.md)。开发进度见 [PLAN.md](./PLAN.md)。
 

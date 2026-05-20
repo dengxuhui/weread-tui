@@ -5,12 +5,11 @@ weread/api.py — 封装微信读书网页版 API 的所有请求。
     async with WeReadClient(vid, skey) as client:
         shelf = await client.get_shelf()
 
-端点优先级说明：
-- 书架 / 书籍信息：使用 https://weread.qq.com/web/...（已验证可用）
-- 章节列表：优先 POST https://i.weread.qq.com/book/chapterInfos，
-            回退 GET /web/book/chapterInfos
-- 章节正文：优先 GET https://i.weread.qq.com/book/chapter/e3，
-            回退 GET /web/book/chapter/e3
+端点说明：
+- 书架 / 书籍信息 / 章节目录：使用 https://weread.qq.com/web/... 和
+  https://i.weread.qq.com/... 组合回退
+- 章节正文：统一通过 Playwright 打开网页版阅读器，由前端解密后从 DOM 提取
+  （不再依赖 e3 / e_N 直连 HTTP 返回正文）
 """
 
 from __future__ import annotations
@@ -88,6 +87,29 @@ def _check_cookie_expired(resp: httpx.Response) -> None:
         # JSON 解析失败时忽略（正文可能不是 JSON）
 
 
+def _build_chapters_from_outline(uids: list[int], items_array: list[dict]) -> list[dict]:
+    """
+    从 /web/book/outline 的 itemsArray 响应构建章节列表。
+
+    uids[i] 与 items_array[i] 是位置对应关系（positional mapping）。
+    每个条目的第一个 level<=2 的 items.text 作为章节标题；
+    若该条目无 items 字段（纯占位节点）则回退到 "章节 {uid}"。
+    """
+    chapters: list[dict] = []
+    for i, uid in enumerate(uids):
+        entry = items_array[i] if i < len(items_array) else {}
+        title = ""
+        for item in entry.get("items", []):
+            if isinstance(item, dict) and item.get("level", 99) <= 2:
+                title = item.get("text", "").strip()
+                if title:
+                    break
+        if not title:
+            title = f"章节 {uid}"
+        chapters.append({"chapterUid": uid, "title": title})
+    return chapters
+
+
 # ---------------------------------------------------------------------------
 # 主类
 # ---------------------------------------------------------------------------
@@ -153,12 +175,20 @@ class WeReadClient:
         """
         if self._client is None:
             raise RuntimeError("WeReadClient 未初始化，请使用 async with 或先调用 aopen()")
+        _debug_log(f"[GET] {path} params={params}")
         try:
             resp = await self._client.get(path, params=params)
         except httpx.TimeoutException as exc:
+            _debug_log(f"[GET] TIMEOUT {path}")
             raise NetworkError(f"请求超时：{path}") from exc
         except httpx.NetworkError as exc:
+            _debug_log(f"[GET] NETWORK_ERROR {path}: {exc}")
             raise NetworkError(f"网络错误：{path} — {exc}") from exc
+        _debug_log(
+            f"[GET] {path} → {resp.status_code} "
+            f"ct={resp.headers.get('content-type', '')!r} "
+            f"body[:3000]={resp.text[:3000]!r}"
+        )
         _check_cookie_expired(resp)
         resp.raise_for_status()
         return resp
@@ -170,12 +200,20 @@ class WeReadClient:
         """
         if self._client is None:
             raise RuntimeError("WeReadClient 未初始化，请使用 async with 或先调用 aopen()")
+        _debug_log(f"[POST] {url} body_sent={body!r}")
         try:
             resp = await self._client.post(url, json=body)
         except httpx.TimeoutException as exc:
+            _debug_log(f"[POST] TIMEOUT {url}")
             raise NetworkError(f"请求超时：{url}") from exc
         except httpx.NetworkError as exc:
+            _debug_log(f"[POST] NETWORK_ERROR {url}: {exc}")
             raise NetworkError(f"网络错误：{url} — {exc}") from exc
+        _debug_log(
+            f"[POST] {url} → {resp.status_code} "
+            f"ct={resp.headers.get('content-type', '')!r} "
+            f"body[:3000]={resp.text[:3000]!r}"
+        )
         _check_cookie_expired(resp)
         resp.raise_for_status()
         return resp
@@ -213,177 +251,175 @@ class WeReadClient:
         """
         获取章节列表（chapterUid、标题、字数等）。
 
-        优先 POST https://i.weread.qq.com/book/chapterInfos（JSON body）
-        回退  GET  /web/book/chapterInfos?bookIds={book_id}&synckeys=0
+        依次尝试多个端点，全部失败时返回 []（不抛异常）：
+          1. POST https://i.weread.qq.com/book/chapterInfos（JSON body）
+          2. GET  /web/book/chapterInfos?bookIds={book_id}&synckeys=0
+          3. POST /web/book/outline（bookId 在 body）
+          4. POST /web/book/outline（bookKey 在 body，需先解析 encodeId）
 
-        两种响应格式均支持：
+        支持的响应格式：
           {"data": [{"updated": [...]}]}       ← i.weread.qq.com POST
           {"data": [{"chapterInfos": [...]}]}  ← weread.qq.com/web GET
+          {"chapterInfos": [...]}              ← /web/book/outline
         """
-        # ---- 尝试 i.weread.qq.com POST ----
-        try:
-            resp = await self._post_json(
-                f"{_BASE_I}/book/chapterInfos",
-                {"bookIds": [book_id], "synckeys": [0], "teenmode": 0},
-            )
-            body: dict = resp.json()
-            data = body.get("data") or []
-            if data and isinstance(data, list):
-                first = data[0]
-                if isinstance(first, dict):
-                    # 优先 "updated"，兼容 "chapterInfos" / "chapters"
-                    chapters = (
-                        first.get("updated")
-                        or first.get("chapterInfos")
-                        or first.get("chapters")
-                        or []
-                    )
-                    if chapters:
-                        return chapters
-        except Exception:
-            pass  # 静默降级至 GET
 
-        # ---- 回退：weread.qq.com/web GET ----
-        resp = await self._get(
-            "/web/book/chapterInfos",
-            bookIds=book_id,
-            synckeys=0,
-        )
-        body = resp.json()
-        data = body.get("data") or []
-        if data and isinstance(data, list):
-            first = data[0]
-            if isinstance(first, dict):
+        def _extract_chapters(body: dict) -> list:
+            """从各种响应格式中提取章节列表。"""
+            # 顶层直接是列表字段
+            chapters = (
+                body.get("chapterInfos")
+                or body.get("updated")
+                or body.get("chapters")
+                or []
+            )
+            if chapters:
+                return chapters
+            # 带 data 包装
+            inner = body.get("data") or []
+            if inner and isinstance(inner, list):
+                first = inner[0] if isinstance(inner[0], dict) else {}
                 chapters = (
                     first.get("chapterInfos")
                     or first.get("updated")
                     or first.get("chapters")
                     or []
                 )
-                if chapters:
-                    return chapters
-        return data
+            return chapters
 
-    async def _fetch_chapter_html(self, book_id_param: str, chapter_uid: int) -> str | None:
-        """
-        用给定的 book_id_param（可以是数字 bookId 或字母数字 bookKey）尝试两个端点。
-        返回 HTML 字符串；两个端点均 404 时返回 None；DRM 或其他错误直接抛出。
-        """
-        for url in (
-            f"{_BASE_I}/book/chapter/e3",
-            "/web/book/chapter/e3",
-        ):
-            try:
-                resp = await self._get(url, bookId=book_id_param, chapterUid=chapter_uid)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    _debug_log(f"404 from {url} bookId={book_id_param} chapterUid={chapter_uid}")
-                    continue
-                raise
-            except Exception:
-                raise
-
+        # ---- 1. i.weread.qq.com POST ----
+        try:
+            _debug_log(f"get_chapter_list [1] POST i.weread bookId={book_id}")
+            resp = await self._post_json(
+                f"{_BASE_I}/book/chapterInfos",
+                {"bookIds": [book_id], "synckeys": [0], "teenmode": 0},
+            )
             body: dict = resp.json()
+            _debug_log(f"get_chapter_list [1] top-level keys={list(body.keys())}")
+            chapters = _extract_chapters(body)
+            if chapters:
+                _debug_log(f"get_chapter_list [1] OK: {len(chapters)} chapters, first={chapters[0]!r}")
+                return chapters
+            _debug_log(f"get_chapter_list [1] no chapters in response, full_body={resp.text!r}")
+        except Exception as exc:
+            _debug_log(f"get_chapter_list [1] failed: {type(exc).__name__}: {exc}")
+
+        # ---- 2. weread.qq.com/web GET ----
+        try:
+            _debug_log(f"get_chapter_list [2] GET /web/book/chapterInfos bookId={book_id}")
+            resp = await self._get(
+                "/web/book/chapterInfos",
+                bookIds=book_id,
+                synckeys=0,
+            )
+            body = resp.json()
+            _debug_log(f"get_chapter_list [2] top-level keys={list(body.keys())}")
+            chapters = _extract_chapters(body)
+            if chapters:
+                _debug_log(f"get_chapter_list [2] OK: {len(chapters)} chapters, first={chapters[0]!r}")
+                return chapters
+            _debug_log(f"get_chapter_list [2] no chapters in response, full_body={resp.text!r}")
+        except Exception as exc:
+            _debug_log(f"get_chapter_list [2] failed: {type(exc).__name__}: {exc}")
+
+        # ---- 3. POST /web/book/outline（bookId）----
+        try:
+            _debug_log(f"get_chapter_list [3] POST /web/book/outline bookId={book_id}")
+            resp = await self._post_json(
+                f"{_BASE}/web/book/outline",
+                {"bookId": book_id},
+            )
+            body = resp.json()
+            _debug_log(f"get_chapter_list [3] top-level keys={list(body.keys())}")
+            chapters = _extract_chapters(body)
+            if chapters:
+                _debug_log(f"get_chapter_list [3] OK: {len(chapters)} chapters, first={chapters[0]!r}")
+                return chapters
+            _debug_log(f"get_chapter_list [3] no chapters in response, full_body={resp.text!r}")
+        except Exception as exc:
+            _debug_log(f"get_chapter_list [3] failed: {type(exc).__name__}: {exc}")
+
+        # ---- 4. POST /web/book/outline（bookKey / encodeId）----
+        book_key: str | None = None
+        _book_info: dict = {}
+        try:
+            _book_info = await self.get_book_info(book_id)
+            book_key = _book_info.get("encodeId") or None
             _debug_log(
-                f"Response keys from {url} bookId={book_id_param} "
-                f"chapterUid={chapter_uid}: {list(body.keys())[:10]}"
+                f"get_chapter_list [4] get_book_info OK: "
+                f"encodeId={book_key!r} "
+                f"lastChapterIdx={_book_info.get('lastChapterIdx')!r} "
+                f"chapterCount={_book_info.get('chapterCount')!r}"
             )
+        except Exception as exc:
+            _debug_log(f"get_chapter_list [4] get_book_info failed: {type(exc).__name__}: {exc}")
 
-            if body.get("encrypt") or body.get("encryptType") or body.get("errCode") == -2010:
-                _debug_log(
-                    f"DRM detected at {url}: "
-                    f"encrypt={body.get('encrypt')}, "
-                    f"encryptType={body.get('encryptType')}, "
-                    f"errCode={body.get('errCode')}"
+        if book_key and book_key != book_id:
+            try:
+                _debug_log(f"get_chapter_list [4] POST /web/book/outline bookKey={book_key}")
+                resp = await self._post_json(
+                    f"{_BASE}/web/book/outline",
+                    {"bookId": book_key},
                 )
-                raise DRMChapterError(f"章节 {chapter_uid} 已加密（DRM），无法在终端阅读")
+                body = resp.json()
+                _debug_log(f"get_chapter_list [4] top-level keys={list(body.keys())}")
+                chapters = _extract_chapters(body)
+                if chapters:
+                    _debug_log(f"get_chapter_list [4] OK: {len(chapters)} chapters, first={chapters[0]!r}")
+                    return chapters
+                _debug_log(f"get_chapter_list [4] no chapters in response, full_body={resp.text!r}")
+            except Exception as exc:
+                _debug_log(f"get_chapter_list [4] failed: {type(exc).__name__}: {exc}")
 
-            html: str | None = body.get("data") or body.get("html") or body.get("content")
-            if html:
-                return html
-
-            _debug_log(f"No content field in response from {url}: keys={list(body.keys())}")
-            raise DRMChapterError(
-                f"章节 {chapter_uid} 无法获取正文（可能为 DRM 章节或 API 变更）"
-            )
-
-        return None  # 两个端点均 404
-
-    async def _fetch_chapter_html_segmented(
-        self, book_id_param: str, chapter_uid: int
-    ) -> str | None:
-        """
-        尝试新式分段端点 /book/chapter/e_0, e_1, …
-        依次请求各段直至遇到 404，将各段 HTML 拼接后返回完整正文。
-        首段（e_0）404 时返回 None，表示该端点格式对此书不适用。
-        """
-        parts: list[str] = []
-        for n in range(50):
-            got = False
-            for url in (
-                f"{_BASE_I}/book/chapter/e_{n}",
-                f"/web/book/chapter/e_{n}",
-            ):
-                try:
-                    resp = await self._get(
-                        url, bookId=book_id_param, chapterUid=chapter_uid
-                    )
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 404:
+        # ---- 5. POST /web/book/outline（bookId + chapterUids list）----
+        # 浏览器实际发送的请求：{"bookId": "827159", "chapterUids": [2, 3, ..., 59]}
+        # lastChapterIdx 来自 get_book_info，uids = range(2, lastChapterIdx+1)
+        last_idx = (
+            _book_info.get("lastChapterIdx")
+            or _book_info.get("chapterCount")
+            or 0
+        )
+        if last_idx and int(last_idx) > 1:
+            uids = list(range(2, int(last_idx) + 1))
+            try:
+                _debug_log(
+                    f"get_chapter_list [5] POST /web/book/outline bookId={book_id} "
+                    f"uids[0:5]={uids[:5]} total={len(uids)}"
+                )
+                resp = await self._post_json(
+                    f"{_BASE}/web/book/outline",
+                    {"bookId": book_id, "chapterUids": uids},
+                )
+                body = resp.json()
+                _debug_log(f"get_chapter_list [5] top-level keys={list(body.keys())}")
+                items_array = body.get("itemsArray") or []
+                if items_array:
+                    chapters = _build_chapters_from_outline(uids, items_array)
+                    if chapters:
                         _debug_log(
-                            f"404 from {url} bookId={book_id_param} "
-                            f"chapterUid={chapter_uid}"
+                            f"get_chapter_list [5] OK: {len(chapters)} chapters, "
+                            f"first={chapters[0]!r}"
                         )
-                        continue
-                    raise
-
-                body: dict = resp.json()
+                        return chapters
                 _debug_log(
-                    f"Segment e_{n} from {url} bookId={book_id_param}: "
-                    f"keys={list(body.keys())[:5]}"
+                    f"get_chapter_list [5] no chapters: "
+                    f"itemsArray len={len(items_array)}, "
+                    f"body[:500]={resp.text[:500]!r}"
                 )
+            except Exception as exc:
+                _debug_log(f"get_chapter_list [5] failed: {type(exc).__name__}: {exc}")
 
-                if (body.get("encrypt") or body.get("encryptType")
-                        or body.get("errCode") == -2010):
-                    raise DRMChapterError(
-                        f"章节 {chapter_uid} 已加密（DRM），无法在终端阅读"
-                    )
-
-                html: str | None = (
-                    body.get("data") or body.get("html") or body.get("content")
-                )
-                if html:
-                    parts.append(html)
-                    got = True
-                    break  # 该段成功，继续取下一段
-
-                _debug_log(f"Segment e_{n}: no content field, stopping")
-                break  # 200 但无正文，视为已无更多段
-
-            if not got:
-                if n == 0:
-                    return None  # e_0 不可用，此端点格式不适用
-                break  # 无更多段
-
-        return "".join(parts) if parts else None
+        _debug_log(f"get_chapter_list all attempts failed for bookId={book_id}, returning []")
+        return []
 
     async def get_chapter_content(self, book_id: str, chapter_uid: int) -> str:
         """
-        获取章节正文 HTML。
+        获取章节正文 HTML（Playwright 主链路）。
 
-        回退策略（依次尝试）：
-          1. e3 端点 + 数字 bookId
-          2. e3 端点 + bookKey（encodeId）
-          3. e_N 分段端点 + 数字 bookId（新版书籍将章节拆成多段）
-          4. e_N 分段端点 + bookKey
-          5. Playwright browser fallback
+        说明：
+          - 由于网页版章节 HTTP 端点（e3 / e_N）经常变更、401/404 波动，
+            本方法不再走直连 HTTP 拉正文。
+          - 统一使用浏览器上下文触发微信读书前端解密并从 DOM 提取正文。
         """
-        # ---- 1. 数字 bookId，e3 格式 ----
-        html = await self._fetch_chapter_html(book_id, chapter_uid)
-        if html is not None:
-            return html
-
-        # ---- 解析 bookKey（encodeId），供后续步骤复用 ----
         book_key: str | None = None
         try:
             info = await self.get_book_info(book_id)
@@ -393,38 +429,17 @@ class WeReadClient:
         except Exception as exc:
             _debug_log(f"get_book_info failed (bookId={book_id}): {exc}")
 
-        # ---- 2. bookKey，e3 格式 ----
-        if book_key and book_key != book_id:
-            _debug_log(f"Retrying with bookKey={book_key!r} (numeric bookId={book_id} returned 404)")
-            html = await self._fetch_chapter_html(book_key, chapter_uid)
-            if html is not None:
-                return html
-
-        # ---- 3. 数字 bookId，e_N 分段格式（新版书籍）----
-        html = await self._fetch_chapter_html_segmented(book_id, chapter_uid)
-        if html is not None:
-            _debug_log(f"Got chapter via segmented e_N (bookId={book_id})")
-            return html
-
-        # ---- 4. bookKey，e_N 分段格式 ----
-        if book_key and book_key != book_id:
-            html = await self._fetch_chapter_html_segmented(book_key, chapter_uid)
-            if html is not None:
-                _debug_log(f"Got chapter via segmented e_N (bookKey={book_key})")
-                return html
-
-        # ---- 5. browser fallback ----
         _debug_log(
-            f"All HTTP endpoints returned 404 for bookId={book_id} bookKey={book_key} "
-            f"chapterUid={chapter_uid}; trying Playwright browser fallback"
+            f"Using Playwright primary pipeline for chapter content: "
+            f"bookId={book_id} bookKey={book_key} chapterUid={chapter_uid}"
         )
         html = await self._browser_fallback(book_id, chapter_uid, book_key=book_key)
         if html is not None:
             return html
 
         raise DRMChapterError(
-            f"章节 {chapter_uid} 暂不可用（两个端点均返回 404，"
-            "可能为加密章节或该书不支持网页版阅读）"
+            f"章节 {chapter_uid} 暂不可用（浏览器链路未获取到正文，"
+            "可能为 DRM 章节或页面结构变更）"
         )
 
     async def _browser_fallback(

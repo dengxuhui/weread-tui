@@ -199,9 +199,9 @@ weread = "weread.cli:main"
 **目标**：端到端可用，异常处理完整。
 
 - [ ] 端到端手动测试：登录 → 书架 → 打开书 → 翻章节 → 返回书架 → 退出（需真实 Cookie，留待用户验证）<!-- 需真实环境 -->
-- [x] `browser.py`：Playwright headless Chromium 作为第三级 fallback（两个 HTTP 端点均 404 时触发）
+- [x] `browser.py`：Playwright headless Chromium 作为章节正文主链路（不再依赖直连正文 HTTP 端点）
 - [x] `api.py`：`_debug_log` 写入 `~/.config/weread-tui/debug.log`；`_browser_fallback` 方法集成 browser.py
-- [x] `pyproject.toml`：新增 `[browser]` optional extra（`playwright>=1.40.0`）
+- [x] `pyproject.toml`：将 `playwright>=1.40.0` 升级为核心依赖
 - [x] `tests/test_browser.py`：10 个测试用例，全部通过（168/168）
 - [x] Cookie 过期场景：捕获 `CookieExpiredError`，提示用户执行 `weread login`
 - [x] 网络断开场景：捕获 `NetworkError`，显示友好提示

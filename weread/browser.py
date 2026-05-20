@@ -21,6 +21,9 @@ weread/browser.py — Playwright headless Chromium 方案获取章节正文。
 from __future__ import annotations
 
 import asyncio
+import html as _html
+import hashlib
+import json
 import re as _re
 
 __all__ = ["BrowserFetchError", "fetch_chapter_via_browser"]
@@ -30,6 +33,380 @@ _NAV_TIMEOUT_MS = 20_000  # Playwright 页面导航超时 ms
 _DOM_RENDER_WAIT = 3.0    # e_N 最后一个请求后等待 JS 渲染完成的秒数
 _DOM_POLL_INTERVAL = 0.5  # 轮询 DOM 内容的间隔秒数
 _DOM_MIN_TEXT_LEN = 300   # DOM 文本量超过此值才认为内容已渲染
+
+_CANVAS_CAPTURE_INIT_SCRIPT = r"""
+(() => {
+  if (window.__wrCanvasCaptureInstalled) return;
+  window.__wrCanvasCaptureInstalled = true;
+
+  const state = {
+    records: [],
+    maxRecords: 120000,
+    page: 0,
+    lastPageAt: 0,
+  };
+
+  function pushRecord(text, x, y, font, color) {
+    const t = String(text || "").trim();
+    if (!t) return;
+    if (state.records.length >= state.maxRecords) return;
+    state.records.push({
+      text: t,
+      x: Number.isFinite(Number(x)) ? Number(x) : 0,
+      y: Number.isFinite(Number(y)) ? Number(y) : 0,
+      font: String(font || ""),
+      color: String(color || ""),
+      ts: Date.now(),
+      page: state.page,
+      idx: state.records.length,
+    });
+  }
+
+  function markNewPage() {
+    const now = Date.now();
+    if (now - state.lastPageAt < 120) return;
+    state.page += 1;
+    state.lastPageAt = now;
+  }
+
+  function wrapContext(ctx) {
+    if (!ctx || ctx.__wrCanvasWrapped || typeof ctx.fillText !== "function") return ctx;
+    const origFillText = ctx.fillText.bind(ctx);
+    const origClearRect = typeof ctx.clearRect === "function"
+      ? ctx.clearRect.bind(ctx)
+      : null;
+    ctx.fillText = function (text, x, y, maxWidth) {
+      try {
+        pushRecord(text, x, y, ctx.font, ctx.fillStyle);
+      } catch (_) {}
+      return origFillText(text, x, y, maxWidth);
+    };
+    if (origClearRect) {
+      ctx.clearRect = function (x, y, w, h) {
+        try {
+          markNewPage();
+        } catch (_) {}
+        return origClearRect(x, y, w, h);
+      };
+    }
+    ctx.__wrCanvasWrapped = true;
+    return ctx;
+  }
+
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (...args) {
+    const ctx = origGetContext.apply(this, args);
+    return wrapContext(ctx);
+  };
+
+  window.__wrCanvasCapture = {
+    clear() {
+      state.records = [];
+    },
+    stats() {
+      return {
+        count: state.records.length,
+        page: state.page,
+      };
+    },
+    exportText() {
+      const groups = new Map();
+      for (const row of state.records) {
+        const key = String(row.page || 0);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(row);
+      }
+
+      const pageKeys = [...groups.keys()]
+        .map((x) => Number(x))
+        .sort((a, b) => a - b);
+      const cleaned = [];
+      let columnMode = "single";
+
+      for (const pageNo of pageKeys) {
+        const pageRows = (groups.get(String(pageNo)) || []).slice().sort((a, b) => {
+          if (Math.abs(a.y - b.y) > 1) return a.y - b.y;
+          return a.x - b.x;
+        });
+
+        const lines = [];
+        let cur = [];
+        let curY = null;
+        for (const row of pageRows) {
+          if (curY === null || Math.abs(row.y - curY) <= 2) {
+            cur.push(row);
+            curY = curY === null ? row.y : (curY + row.y) / 2;
+            continue;
+          }
+          cur.sort((a, b) => a.x - b.x);
+          lines.push({
+            text: cur.map((x) => x.text).join(""),
+            x: cur.length ? cur[0].x : 0,
+            y: curY || 0,
+            idx: cur.length ? cur[0].idx : 0,
+          });
+          cur = [row];
+          curY = row.y;
+        }
+        if (cur.length) {
+          cur.sort((a, b) => a.x - b.x);
+          lines.push({
+            text: cur.map((x) => x.text).join(""),
+            x: cur.length ? cur[0].x : 0,
+            y: curY || 0,
+            idx: cur.length ? cur[0].idx : 0,
+          });
+        }
+
+        let pageLines = lines
+          .map((x) => ({
+            text: x.text.replace(/\s+/g, " ").trim(),
+            x: x.x,
+            y: x.y,
+            idx: x.idx,
+          }))
+          .filter((x) => x.text.length > 0);
+
+        if (pageLines.length >= 10) {
+          const xs = pageLines.map((x) => x.x).sort((a, b) => a - b);
+          let splitX = null;
+          let maxGap = 0;
+          for (let i = 1; i < xs.length; i += 1) {
+            const gap = xs[i] - xs[i - 1];
+            if (gap > maxGap) {
+              maxGap = gap;
+              splitX = (xs[i] + xs[i - 1]) / 2;
+            }
+          }
+
+          if (splitX !== null && maxGap >= 120) {
+            const left = pageLines
+              .filter((x) => x.x < splitX)
+              .sort((a, b) => (Math.abs(a.y - b.y) > 1 ? a.y - b.y : a.idx - b.idx));
+            const right = pageLines
+              .filter((x) => x.x >= splitX)
+              .sort((a, b) => (Math.abs(a.y - b.y) > 1 ? a.y - b.y : a.idx - b.idx));
+
+            if (left.length >= 4 && right.length >= 4) {
+              columnMode = "dual";
+              const leftAvg = left.reduce((acc, x) => acc + x.x, 0) / left.length;
+              const rightAvg = right.reduce((acc, x) => acc + x.x, 0) / right.length;
+              pageLines = leftAvg <= rightAvg ? [...left, ...right] : [...right, ...left];
+            } else {
+              pageLines.sort((a, b) => (Math.abs(a.y - b.y) > 1 ? a.y - b.y : a.idx - b.idx));
+            }
+          } else {
+            pageLines.sort((a, b) => (Math.abs(a.y - b.y) > 1 ? a.y - b.y : a.idx - b.idx));
+          }
+        } else {
+          pageLines.sort((a, b) => (Math.abs(a.y - b.y) > 1 ? a.y - b.y : a.idx - b.idx));
+        }
+
+        for (const line of pageLines) {
+          const last = cleaned.length ? cleaned[cleaned.length - 1] : "";
+          if (last !== line.text) cleaned.push(line.text);
+        }
+      }
+
+      const text = cleaned.join("\n");
+      return {
+        lineCount: cleaned.length,
+        text,
+        columnMode,
+      };
+    },
+  };
+})();
+"""
+
+
+def _looks_like_finished_overlay_html(html: str) -> bool:
+    """粗略判断提取结果是否是“全书完”覆盖层，而非章节正文。"""
+    sample = html[:1200]
+    compact = "".join(sample.split())
+    return (
+        "全书完" in compact
+        and "已阅读" in compact
+        and ("推荐值" in compact or "点评" in compact)
+    )
+
+
+def _plain_text_to_html(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines()]
+    blocks = [line for line in lines if line]
+    if not blocks:
+        return ""
+    return "".join(f"<p>{_html.escape(line)}</p>" for line in blocks)
+
+
+def _wr_hash(s: str) -> str:
+    """与网页 reader 路由兼容的章节 hash（参考 weread-exporter）。"""
+    hash_str = hashlib.md5(s.encode()).hexdigest()
+    result = hash_str[:3] + "32" + hash_str[-2:]
+    chunks: list[str] = []
+    for i in range(0, len(s), 9):
+        chunks.append(f"{int(s[i : min(i + 9, len(s))]):x}")
+    for i, item in enumerate(chunks):
+        item_len = f"{len(item):x}"
+        if len(item_len) == 1:
+            item_len = "0" + item_len
+        result += item_len + item
+        if i < len(chunks) - 1:
+            result += "g"
+    if len(result) < 20:
+        result += hash_str[: 20 - len(result)]
+    result += hashlib.md5(result.encode()).hexdigest()[:3]
+    return result
+
+
+def _build_navigation_urls(reader_path: str, book_id: str, chapter_uid: int) -> list[str]:
+    """构建章节跳转 URL 候选，优先 bookKey，再尝试 chapter hash 路由。"""
+    ts = int(asyncio.get_event_loop().time() * 1000)
+    chapter_hash = _wr_hash(str(chapter_uid))
+    return [
+        f"https://weread.qq.com/web/reader/{reader_path}?chapterUid={chapter_uid}&_ts={ts}",
+        f"https://weread.qq.com/web/reader/{reader_path}k{chapter_hash}?_ts={ts}",
+        f"https://weread.qq.com/web/reader/{book_id}?chapterUid={chapter_uid}&_ts={ts}",
+        f"https://weread.qq.com/web/reader/{book_id}k{chapter_hash}?_ts={ts}",
+    ]
+
+
+def _is_canvas_noise_line(line: str) -> bool:
+    compact = line.replace(" ", "")
+    if "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" in compact:
+        return True
+    ascii_chars = sum(1 for ch in line if ord(ch) < 128)
+    if len(line) >= 60 and ascii_chars / max(len(line), 1) >= 0.9:
+        return True
+    return False
+
+
+async def _extract_canvas_content(page, debug_log) -> str | None:
+    """从 Canvas fillText 捕获数据恢复章节纯文本。"""
+    async def _canvas_stats() -> dict[str, int]:
+        payload = await page.evaluate(
+            """
+            () => {
+                const cap = window.__wrCanvasCapture;
+                if (!cap || !cap.stats) return {count: 0, page: 0};
+                return cap.stats();
+            }
+            """
+        )
+        if not isinstance(payload, dict):
+            return {"count": 0, "page": 0}
+        return {
+            "count": int(payload.get("count", 0) or 0),
+            "page": int(payload.get("page", 0) or 0),
+        }
+
+    async def _turn_next_page() -> str:
+        return await page.evaluate(
+            """
+            () => {
+                const btn = document.querySelector('button.readerFooter_button');
+                if (!btn) return 'no_button';
+                const text = (btn.innerText || '').trim();
+                if (text.includes('下一页')) {
+                    btn.click();
+                    return 'clicked';
+                }
+                if (text.includes('下一章') || text.includes('全书完')) return 'end';
+                if (text.includes('登录')) return 'login';
+                return 'other';
+            }
+            """
+        )
+
+    async def _wait_canvas_growth(before_count: int, before_page: int) -> dict[str, int]:
+        deadline = asyncio.get_event_loop().time() + 2.2
+        latest = {"count": before_count, "page": before_page}
+        while asyncio.get_event_loop().time() < deadline:
+            latest = await _canvas_stats()
+            if latest["count"] > before_count + 8 or latest["page"] > before_page:
+                return latest
+            await asyncio.sleep(0.2)
+        return latest
+
+    # 自适应分页：优先点“下一页”，无按钮时退化 PageDown，直到长期无新增。
+    no_growth_rounds = 0
+    for _ in range(80):
+        before = await _canvas_stats()
+        action = await _turn_next_page()
+        used_pagedown = False
+        debug_log(
+            f"canvas paginate: action={action} before_count={before['count']} before_page={before['page']}"
+        )
+
+        if action == "login":
+            break
+
+        if action == "clicked":
+            await asyncio.sleep(0.35)
+            after = await _wait_canvas_growth(before["count"], before["page"])
+        elif action in {"no_button", "other"}:
+            used_pagedown = True
+            await page.keyboard.press("PageDown")
+            await asyncio.sleep(0.25)
+            after = await _wait_canvas_growth(before["count"], before["page"])
+        else:
+            break
+
+        action_label = f"{action}+pagedown" if used_pagedown else action
+        debug_log(
+            f"canvas paginate: after_count={after['count']} after_page={after['page']} action={action_label}"
+        )
+
+        count_growth = after["count"] - before["count"]
+        page_growth = after["page"] - before["page"]
+        if count_growth < 8 and page_growth <= 0:
+            no_growth_rounds += 1
+        else:
+            no_growth_rounds = 0
+        if no_growth_rounds >= 5:
+            break
+
+    # 收尾补滚动，兼容 footer 不可见但可继续渲染的页面。
+    for _ in range(2):
+        await page.keyboard.press("PageDown")
+        await asyncio.sleep(0.25)
+
+    deadline = asyncio.get_event_loop().time() + 10.0
+    while asyncio.get_event_loop().time() < deadline:
+        stats = await _canvas_stats()
+        count = stats["count"]
+        page_no = stats["page"]
+        debug_log(f"canvas capture records: {count} pages={page_no}")
+        if count >= 200:
+            break
+        await asyncio.sleep(_DOM_POLL_INTERVAL)
+
+    payload = await page.evaluate(
+        """
+        () => {
+            const cap = window.__wrCanvasCapture;
+            if (!cap || !cap.exportText) return null;
+            return cap.exportText();
+        }
+        """
+    )
+    if not isinstance(payload, dict):
+        return None
+    text = str(payload.get("text", ""))
+    column_mode = str(payload.get("columnMode", "unknown"))
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    lines = [x for x in lines if not _is_canvas_noise_line(x)]
+    text = "\n".join(lines)
+    line_count = len(lines)
+    if line_count < 5 or len(text) < 300:
+        return None
+    if _looks_like_finished_overlay_html(text):
+        return None
+    debug_log(
+        f"Canvas extraction succeeded: lines={line_count} text_len={len(text)} "
+        f"column_mode={column_mode}"
+    )
+    return _plain_text_to_html(text)
 
 
 class BrowserFetchError(Exception):
@@ -51,10 +428,19 @@ async def _extract_dom_content(page, debug_log) -> str | None:
 
     # 轮询等待 .readerChapterContent 出现并有内容（JS 解密渲染完毕）
     # 使用 textContent（含隐藏元素），因 headless 模式下 innerText 可能为空
+    # 注意：跳过"全书完"完结页——如有，继续轮询直到实际章节内容出现。
     deadline = asyncio.get_event_loop().time() + 10.0
     while asyncio.get_event_loop().time() < deadline:
         content_len = await page.evaluate("""
             () => {
+                // 先尝试找非完结页的内容元素
+                for (const el of document.querySelectorAll('.readerChapterContent')) {
+                    const t = (el.textContent || '').trim();
+                    if (t.length >= 300 && !(t.includes('全书完') && t.includes('已阅读'))) {
+                        return t.length;
+                    }
+                }
+                // 降级：返回第一个内容长度（可能是完结页）
                 const el = document.querySelector('.readerChapterContent');
                 if (!el) return 0;
                 return (el.textContent || '').trim().length;
@@ -91,6 +477,15 @@ async def _extract_dom_content(page, debug_log) -> str | None:
                 return children;
             }
 
+            // 判断元素是否为"全书完"完结页（用户已读完该书时 WeRead 显示的
+            // 覆盖层）。完结页同样含有 .readerChapterContent 类，但内容与
+            // 章节正文无关，应跳过。
+            function isFinishedBookOverlay(el) {
+                const t = (el.textContent || '').trim();
+                // 完结页特征：同时含"全书完"与"已阅读"
+                return t.includes('全书完') && t.includes('已阅读');
+            }
+
             // 已知 WeRead 阅读器容器选择器
             const selectors = [
                 '.readerChapterContent',
@@ -101,12 +496,29 @@ async def _extract_dom_content(page, debug_log) -> str | None:
                 '[class*="chapter_content"]',
                 '[class*="readerChapter"]',
             ];
+
+            // 收集所有候选元素，优先选择非完结页的候选
+            const seen = new Set();
+            const candidates = [];
             for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el && (el.textContent || '').trim().length >= 100) {
+                for (const el of document.querySelectorAll(sel)) {
+                    if (seen.has(el)) continue;
+                    seen.add(el);
+                    const text = (el.textContent || '').trim();
+                    if (text.length >= 100) {
+                        candidates.push(el);
+                    }
+                }
+            }
+
+            // 第一轮：找到不是完结页的候选
+            for (const el of candidates) {
+                if (!isFinishedBookOverlay(el)) {
                     return simplify(el);
                 }
             }
+
+            // 所有候选均为完结页时返回 null，交给上层重试导航。
             return null;
         }
     """)
@@ -184,6 +596,11 @@ async def fetch_chapter_via_browser(
     result: str | None = None
     e3_done = asyncio.Event()      # 旧格式：e3 JSON 响应已捕获
     en_detected = asyncio.Event()  # 新格式：检测到至少一个 e_N 请求
+    seen_underlines_uids: set[int] = set()
+    seen_read_ci: list[int] = []
+
+    def _chapter_hit() -> bool:
+        return chapter_uid in seen_underlines_uids or chapter_uid in seen_read_ci
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -218,6 +635,30 @@ async def fetch_chapter_via_browser(
             )
 
             page = await context.new_page()
+            await page.add_init_script(_CANVAS_CAPTURE_INIT_SCRIPT)
+
+            async def _on_request(request) -> None:
+                """拦截所有 /book/ API 请求，记录 method / URL / POST body。"""
+                url: str = request.url
+                if "weread.qq.com" in url and "/book/" in url:
+                    try:
+                        post_data = request.post_data  # None if GET
+                        _debug_log(
+                            f"Browser REQUEST [{request.method}]: {url} "
+                            f"post_data={post_data!r}"
+                        )
+
+                        m = _re.search(r"/web/book/underlines\?[^#]*\bchapterUid=(\d+)", url)
+                        if m:
+                            seen_underlines_uids.add(int(m.group(1)))
+
+                        if "/web/book/read" in url and post_data:
+                            payload = json.loads(post_data)
+                            ci = payload.get("ci")
+                            if isinstance(ci, int):
+                                seen_read_ci.append(ci)
+                    except Exception as exc:
+                        _debug_log(f"Browser request log error: {exc}")
 
             async def _on_response(response) -> None:
                 nonlocal result
@@ -225,6 +666,27 @@ async def fetch_chapter_via_browser(
 
                 if "weread.qq.com" in url and "/book/" in url:
                     _debug_log(f"Browser API [{response.status}]: {url}")
+                    # 非章节内容端点：记录完整响应体（章节内容可能是加密 blob，跳过）
+                    if response.status == 200 and "/book/chapter" not in url:
+                        try:
+                            body_text = await response.text()
+                            _debug_log(
+                                f"Browser API body ({len(body_text)} chars): "
+                                f"{body_text[:2000]!r}"
+                            )
+                        except Exception as exc:
+                            _debug_log(f"Browser API body read failed: {exc}")
+
+                # ---- outline 端点：记录完整响应体供分析 ----
+                if "/web/book/outline" in url and response.status == 200:
+                    try:
+                        body_text = await response.text()
+                        _debug_log(
+                            f"Browser outline response ({len(body_text)} chars): "
+                            f"{body_text[:3000]!r}"
+                        )
+                    except Exception as exc:
+                        _debug_log(f"Browser outline body read failed: {exc}")
 
                 # ---- 旧格式：e3（JSON 响应，直接捕获）----
                 if "/book/chapter/e3" in url and not e3_done.is_set():
@@ -261,14 +723,52 @@ async def fetch_chapter_via_browser(
                     _debug_log(f"Browser e_N detected: {url}")
                     en_detected.set()
 
+            page.on("request", _on_request)
             page.on("response", _on_response)
 
-            try:
+            async def _navigate(url: str) -> None:
+                try:
+                    await page.evaluate(
+                        """
+                        () => {
+                            const cap = window.__wrCanvasCapture;
+                            if (cap && cap.clear) cap.clear();
+                        }
+                        """
+                    )
+                except Exception:
+                    pass
+                _debug_log(f"Browser navigating to: {url}")
                 await page.goto(
-                    f"https://weread.qq.com/web/reader/{reader_path}",
+                    url,
                     wait_until="domcontentloaded",
                     timeout=_NAV_TIMEOUT_MS,
                 )
+
+            async def _extract_with_fallback() -> str | None:
+                extracted: str | None = None
+                if en_detected.is_set():
+                    _debug_log(f"e_N detected, waiting {_DOM_RENDER_WAIT}s for JS render...")
+                    await asyncio.sleep(_DOM_RENDER_WAIT)
+                    extracted = await _extract_dom_content(page, _debug_log)
+
+                if extracted is None or _looks_like_finished_overlay_html(extracted):
+                    if extracted is not None:
+                        _debug_log("DOM extraction looks like finished overlay, switch to canvas")
+                    canvas_html = await _extract_canvas_content(page, _debug_log)
+                    if canvas_html:
+                        extracted = canvas_html
+
+                if extracted is not None and _looks_like_finished_overlay_html(extracted):
+                    _debug_log(
+                        "Extraction still looks like finished overlay; treat as invalid"
+                    )
+                    extracted = None
+                return extracted
+
+            try:
+                nav_url = _build_navigation_urls(reader_path, book_id, chapter_uid)[0]
+                await _navigate(nav_url)
             except Exception:
                 pass
 
@@ -288,11 +788,40 @@ async def fetch_chapter_via_browser(
                     except (asyncio.CancelledError, Exception):
                         pass
 
-            # 新格式：DOM 提取
-            if result is None and en_detected.is_set():
-                _debug_log(f"e_N detected, waiting {_DOM_RENDER_WAIT}s for JS render...")
-                await asyncio.sleep(_DOM_RENDER_WAIT)
-                result = await _extract_dom_content(page, _debug_log)
+            result = await _extract_with_fallback()
+
+            # 章节命中校验：如果未观察到目标 chapterUid，使用当前 reader 路径重试一次。
+            chapter_hit = chapter_uid in seen_underlines_uids or chapter_uid in seen_read_ci
+            if result is not None and not chapter_hit:
+                _debug_log(
+                    "Target chapter not observed in browser signals "
+                    f"(target={chapter_uid}, underlines={sorted(seen_underlines_uids)}, "
+                    f"read_ci={seen_read_ci}); retry with multi-route strategy"
+                )
+                retry_urls = _build_navigation_urls(reader_path, book_id, chapter_uid)
+                for idx, retry_url in enumerate(retry_urls, start=1):
+                    try:
+                        _debug_log(f"Browser retry[{idx}] navigating to: {retry_url}")
+                        await _navigate(retry_url)
+                        result = await _extract_with_fallback()
+                        if result is not None and _chapter_hit():
+                            break
+                    except Exception as exc:
+                        _debug_log(f"Browser retry[{idx}] navigation failed: {exc}")
+
+            if result is not None and not _chapter_hit():
+                _debug_log(
+                    "chapter miss after extraction, reject result "
+                    f"(target={chapter_uid}, underlines={sorted(seen_underlines_uids)}, "
+                    f"read_ci={seen_read_ci})"
+                )
+                result = None
+            elif result is not None:
+                _debug_log(
+                    "chapter hit confirmed "
+                    f"(target={chapter_uid}, underlines={sorted(seen_underlines_uids)}, "
+                    f"read_ci={seen_read_ci})"
+                )
 
         finally:
             await browser.close()

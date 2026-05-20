@@ -45,6 +45,9 @@ git clone https://github.com/yourname/weread-tui.git
 cd weread-tui
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
+
+# 安装 Playwright 浏览器内核（首次必需）
+.venv/bin/playwright install chromium
 ```
 
 ---
@@ -107,6 +110,14 @@ weread logout
 - **DRM 加密章节**：显示提示，无法渲染内容
 - **图文书籍**：`<img>` 以 `[图片]` 占位，不渲染图片
 - **离线阅读**：不支持，章节内容不缓存
+
+---
+
+## 章节正文链路
+
+- 当前版本将 **Playwright 作为章节正文主链路**：打开网页阅读器并从 DOM 提取已解密内容
+- 原因：微信读书网页版的 `e3/e_N` 直连 HTTP 端点在不同书籍上波动较大，稳定性不足
+- 首次运行前需执行：`playwright install chromium`
 
 ---
 

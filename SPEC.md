@@ -67,7 +67,8 @@
 | 模块 | 职责 |
 |------|------|
 | `auth.py` | 浏览器扫码登录，提取并持久化 Cookie，检测过期并提示重新登录 |
-| `api.py` | 封装所有网页版 API 请求，统一错误处理与重试 |
+| `api.py` | 封装书架/目录 API 请求，章节正文走 Playwright 主链路 |
+| `browser.py` | Playwright 打开阅读器页面，提取前端解密后的章节 DOM |
 | `parser.py` | 将章节 HTML 转换为 Textual Rich Markup，处理粗体、斜体、引用块 |
 | `state.py` | 本地阅读位置缓存，辅助快速恢复上次进度（云端同步为主） |
 | `tui/app.py` | Textual 主 App，管理视图切换与全局键盘绑定 |
@@ -190,9 +191,9 @@ GET /web/book/chapterInfos
     ?bookIds={bookId}&synckeys=0
     → 章节列表（chapterUid、标题、字数）
 
-GET /web/book/chapter/e3
-    bookId={bookId}&chapterUid={uid}
-    → 章节正文（HTML 格式）
+章节正文：
+    通过 Playwright 打开 /web/reader/{bookKey}?chapterUid={uid}
+    等待前端请求 e_N 并渲染后，从 DOM 提取章节 HTML
 ```
 
 **书架返回结构（关键字段）：**
@@ -227,14 +228,10 @@ GET /web/book/chapter/e3
 }
 ```
 
-**章节内容返回结构：**
+**章节内容说明：**
 
-```json
-{
-  "chapterUid": 109,
-  "data": "<p>章节正文 HTML...</p>"
-}
-```
+正文不再依赖 `GET /web/book/chapter/e3` 直连响应，
+而是由浏览器上下文触发微信读书前端解密流程后，从页面 DOM 中提取。
 
 ---
 

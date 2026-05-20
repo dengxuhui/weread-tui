@@ -59,6 +59,7 @@ _CSS = """
 }
 
 #content-text {
+    height: auto;
     padding: 0 1;
 }
 
@@ -142,10 +143,10 @@ class TOCOverlay(Vertical):
         yield ListView(id="toc-list")
         yield Static("Esc 关闭", id="toc-hint")
 
-    def load_chapters(self, chapters: list[dict], current_uid: int) -> None:
+    async def load_chapters(self, chapters: list[dict], current_uid: int) -> None:
         """填充章节列表，高亮当前章节。"""
         toc_list = self.query_one("#toc-list", ListView)
-        toc_list.clear()
+        await toc_list.clear()
         for ch in chapters:
             uid = ch.get("chapterUid") or 0
             title = ch.get("title") or f"第{uid}章"
@@ -176,7 +177,9 @@ class ReaderScreen(Screen):
         Binding("j", "scroll_down", "向下", show=False),
         Binding("k", "scroll_up", "向上", show=False),
         Binding("space", "page_down", "翻页", show=True),
+        Binding("pagedown", "page_down", "翻页", show=False),
         Binding("shift+space", "page_up", "上翻", show=False),
+        Binding("pageup", "page_up", "上翻", show=False),
         Binding("[", "prev_chapter", "上一章", show=True),
         Binding("]", "next_chapter", "下一章", show=True),
         Binding("t", "toggle_toc", "目录", show=True),
@@ -219,6 +222,8 @@ class ReaderScreen(Screen):
     def on_mount(self) -> None:
         self._update_header()
         self._apply_width_style()
+        # 明确将焦点放到正文滚动区，避免空格被其他控件吞掉。
+        self.query_one("#content-scroll", VerticalScroll).focus()
         self._load_chapter(self.chapter_uid)
 
     def on_resize(self, event: events.Resize) -> None:
@@ -249,9 +254,14 @@ class ReaderScreen(Screen):
 
     @work(exclusive=True)
     async def _load_chapter(self, chapter_uid: int) -> None:
-        from weread.api import CookieExpiredError, DRMChapterError, NetworkError
+        from weread.api import CookieExpiredError, DRMChapterError, NetworkError, _debug_log
         from weread.parser import parse_chapter
         from weread.tui.app import WeReadApp
+
+        _debug_log(
+            f"_load_chapter: book_id={self.book_id} chapter_uid={chapter_uid} "
+            f"chapters_count={len(self.chapters)}"
+        )
 
         content_text = self.query_one("#content-text", Static)
         content_text.update("[dim]加载章节中...[/dim]")
@@ -281,7 +291,9 @@ class ReaderScreen(Screen):
             content_text.update(f"[red]加载失败：{exc}[/red]")
             return
 
+        _debug_log(f"_load_chapter: html fetched, len={len(html)}, head={html[:200]!r}")
         markup = parse_chapter(html)
+        _debug_log(f"_load_chapter: markup parsed, len={len(markup)}, head={markup[:200]!r}")
         content_text.update(markup)
 
         # 滚回顶部
@@ -290,7 +302,7 @@ class ReaderScreen(Screen):
 
         # 更新 TOC 高亮
         try:
-            self.query_one(TOCOverlay).load_chapters(self.chapters, self.chapter_uid)
+            await self.query_one(TOCOverlay).load_chapters(self.chapters, self.chapter_uid)
         except Exception:
             pass
 
@@ -348,9 +360,16 @@ class ReaderScreen(Screen):
 
     def _navigate_chapter(self, delta: int) -> None:
         """按 delta 切换章节：更新 uid + 刷新 TUI + 保存位置。"""
+        from weread.api import _debug_log
+        _debug_log(
+            f"_navigate_chapter: delta={delta} current_uid={self.chapter_uid} "
+            f"chapters_count={len(self.chapters)}"
+        )
         old_uid = self.chapter_uid
         self._navigate_chapter_uid(delta)
+        _debug_log(f"_navigate_chapter: result uid={self.chapter_uid} (was {old_uid})")
         if self.chapter_uid == old_uid:
+            _debug_log(f"_navigate_chapter: at boundary, no-op")
             return  # 已到边界
 
         self._update_header()
@@ -365,18 +384,32 @@ class ReaderScreen(Screen):
     # ------------------------------------------------------------------
 
     def action_scroll_down(self) -> None:
-        self.query_one("#content-scroll", VerticalScroll).scroll_down(animate=False)
+        scroll = self.query_one("#content-scroll", VerticalScroll)
+        scroll.focus()
+        scroll.scroll_down(animate=False)
 
     def action_scroll_up(self) -> None:
-        self.query_one("#content-scroll", VerticalScroll).scroll_up(animate=False)
+        scroll = self.query_one("#content-scroll", VerticalScroll)
+        scroll.focus()
+        scroll.scroll_up(animate=False)
 
     def action_page_down(self) -> None:
+        from weread.api import _debug_log
         scroll = self.query_one("#content-scroll", VerticalScroll)
+        scroll.focus()
+        before = getattr(scroll, "scroll_y", None)
         scroll.scroll_page_down(animate=False)
+        after = getattr(scroll, "scroll_y", None)
+        _debug_log(f"action_page_down: scroll_y {before} -> {after}")
 
     def action_page_up(self) -> None:
+        from weread.api import _debug_log
         scroll = self.query_one("#content-scroll", VerticalScroll)
+        scroll.focus()
+        before = getattr(scroll, "scroll_y", None)
         scroll.scroll_page_up(animate=False)
+        after = getattr(scroll, "scroll_y", None)
+        _debug_log(f"action_page_up: scroll_y {before} -> {after}")
 
     def action_prev_chapter(self) -> None:
         self._navigate_chapter(-1)
@@ -384,14 +417,14 @@ class ReaderScreen(Screen):
     def action_next_chapter(self) -> None:
         self._navigate_chapter(1)
 
-    def action_toggle_toc(self) -> None:
+    async def action_toggle_toc(self) -> None:
         toc = self.query_one(TOCOverlay)
         if self._toc_visible:
             toc.hide()
             self._toc_visible = False
             self.query_one("#content-scroll", VerticalScroll).focus()
         else:
-            toc.load_chapters(self.chapters, self.chapter_uid)
+            await toc.load_chapters(self.chapters, self.chapter_uid)
             toc.show()
             self._toc_visible = True
 
