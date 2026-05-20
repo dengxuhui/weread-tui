@@ -15,6 +15,8 @@ tests/test_browser.py — weread.browser 模块单元测试。
   8. 导航抛异常时继续等待 XHR（SPA 可能已开始请求）
   9. XHR 响应 JSON 解析失败时忽略该响应
  10. 响应含 html 字段（非 data）时也能正确提取
+ 11. XHR URL 使用 bookKey（非数字 bookId）时，提供 book_key 后成功捕获
+ 12. XHR URL 的 bookId 既不匹配数字 ID 也不匹配 bookKey → 超时
 """
 
 from __future__ import annotations
@@ -455,3 +457,54 @@ async def test_html_field_is_accepted():
     with _inject_playwright(mock_module):
         result = await fetch_chapter_via_browser("vid", "skey", "12345", 1)
     assert result == "<p>来自 html 字段</p>"
+
+
+# ---------------------------------------------------------------------------
+# 11. XHR URL 使用 bookKey 时仍能捕获（新版书籍场景）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_book_key_in_xhr_url_is_captured():
+    """
+    新版书籍 SPA 的 XHR 以 bookKey 作为 bookId 参数。
+    传入 book_key 后过滤器应能匹配，成功返回正文。
+    """
+    book_id = "3300054813"
+    book_key = "71e32c00813ab7be9g013f0e"
+    mock_module, _ = _build_playwright_mock(
+        response_url=(
+            f"https://i.weread.qq.com/book/chapter/e3"
+            f"?bookId={book_key}&chapterUid=315"  # SPA 用 bookKey 作为 bookId
+        ),
+        response_json={"data": "<p>通过 bookKey 获取的正文</p>"},
+    )
+    with _inject_playwright(mock_module):
+        result = await fetch_chapter_via_browser(
+            "vid", "skey", book_id, 315, book_key=book_key
+        )
+    assert result == "<p>通过 bookKey 获取的正文</p>"
+
+
+# ---------------------------------------------------------------------------
+# 12. XHR bookId 既不匹配数字 ID 也不匹配 bookKey → 超时
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_xhr_with_unmatched_id_not_captured():
+    """
+    XHR URL 的 bookId 既不是数字 bookId 也不是 bookKey，
+    即使提供了 book_key 也不应捕获，最终超时。
+    """
+    mock_module, _ = _build_playwright_mock(
+        response_url=(
+            "https://i.weread.qq.com/book/chapter/e3"
+            "?bookId=99999999&chapterUid=315"  # 完全不匹配的 ID
+        ),
+    )
+    with _inject_playwright(mock_module):
+        with pytest.raises(BrowserFetchError, match="超时"):
+            await fetch_chapter_via_browser(
+                "vid", "skey", "3300054813", 315,
+                book_key="71e32c00813ab7be9g013f0e",
+                timeout=0.05,
+            )

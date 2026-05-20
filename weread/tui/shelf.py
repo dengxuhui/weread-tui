@@ -427,6 +427,13 @@ class ShelfScreen(Screen):
                 # 404 / 网络错误 / Cookie 过期等均降级为空章节列表，ReaderScreen 自行处理
                 pass
 
+        # chapterUid=0 表示该书没有阅读记录，用第一章代替
+        from weread.api import _debug_log as _dlog
+        _dlog(f"_push_reader bookId={entry.book_id} chapter_uid={chapter_uid} chapters_count={len(chapters)}")
+        if chapter_uid == 0 and chapters:
+            chapter_uid = chapters[0].get("chapterUid") or 0
+            _dlog(f"_push_reader resolved chapterUid=0 → {chapter_uid} (first chapter)")
+
         await app.show_reader(
             book_id=entry.book_id,
             chapter_uid=chapter_uid,

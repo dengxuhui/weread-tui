@@ -264,45 +264,31 @@ class WeReadClient:
                     return chapters
         return data
 
-    async def get_chapter_content(self, book_id: str, chapter_uid: int) -> str:
+    async def _fetch_chapter_html(self, book_id_param: str, chapter_uid: int) -> str | None:
         """
-        获取章节正文 HTML。
-
-        三级回退策略：
-          1. GET https://i.weread.qq.com/book/chapter/e3?bookId=…&chapterUid=…
-          2. GET /web/book/chapter/e3?bookId=…&chapterUid=…
-          3. Playwright browser fallback（仅当两个端点均返回 404 时）
-
-        返回 HTML 字符串（取响应 JSON 的 data / html / content 字段）。
-        检测到 DRM 加密标记时抛 DRMChapterError（不走 browser fallback）。
-        两个端点均 404 时先尝试 browser fallback，browser 也失败则抛 DRMChapterError。
+        用给定的 book_id_param（可以是数字 bookId 或字母数字 bookKey）尝试两个端点。
+        返回 HTML 字符串；两个端点均 404 时返回 None；DRM 或其他错误直接抛出。
         """
-        last_exc: Exception | None = None
-
         for url in (
-            f"{_BASE_I}/book/chapter/e3",   # 优先 i.weread.qq.com
-            "/web/book/chapter/e3",          # 回退 weread.qq.com/web
+            f"{_BASE_I}/book/chapter/e3",
+            "/web/book/chapter/e3",
         ):
             try:
-                resp = await self._get(url, bookId=book_id, chapterUid=chapter_uid)
+                resp = await self._get(url, bookId=book_id_param, chapterUid=chapter_uid)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404:
-                    _debug_log(
-                        f"404 from {url} bookId={book_id} chapterUid={chapter_uid}"
-                    )
-                    last_exc = exc
-                    continue  # 尝试下一个端点
+                    _debug_log(f"404 from {url} bookId={book_id_param} chapterUid={chapter_uid}")
+                    continue
                 raise
             except Exception:
                 raise
 
             body: dict = resp.json()
             _debug_log(
-                f"Response keys from {url} bookId={book_id} "
+                f"Response keys from {url} bookId={book_id_param} "
                 f"chapterUid={chapter_uid}: {list(body.keys())[:10]}"
             )
 
-            # DRM 检测：直接抛出，不走 browser fallback（内容已加密，浏览器也无法解密）
             if body.get("encrypt") or body.get("encryptType") or body.get("errCode") == -2010:
                 _debug_log(
                     f"DRM detected at {url}: "
@@ -310,54 +296,153 @@ class WeReadClient:
                     f"encryptType={body.get('encryptType')}, "
                     f"errCode={body.get('errCode')}"
                 )
-                raise DRMChapterError(
-                    f"章节 {chapter_uid} 已加密（DRM），无法在终端阅读"
-                )
+                raise DRMChapterError(f"章节 {chapter_uid} 已加密（DRM），无法在终端阅读")
 
             html: str | None = body.get("data") or body.get("html") or body.get("content")
             if html:
                 return html
 
-            # 响应 200 但无正文字段，视为 DRM 或 API 变更，不走 browser fallback
-            _debug_log(
-                f"No content field in response from {url}: keys={list(body.keys())}"
-            )
+            _debug_log(f"No content field in response from {url}: keys={list(body.keys())}")
             raise DRMChapterError(
                 f"章节 {chapter_uid} 无法获取正文（可能为 DRM 章节或 API 变更）"
             )
 
-        # 两个端点均返回 404 → 尝试 browser fallback
-        _debug_log(
-            f"Both HTTP endpoints returned 404 for bookId={book_id} "
-            f"chapterUid={chapter_uid}; trying Playwright browser fallback"
-        )
-        html = await self._browser_fallback(book_id, chapter_uid)
+        return None  # 两个端点均 404
+
+    async def _fetch_chapter_html_segmented(
+        self, book_id_param: str, chapter_uid: int
+    ) -> str | None:
+        """
+        尝试新式分段端点 /book/chapter/e_0, e_1, …
+        依次请求各段直至遇到 404，将各段 HTML 拼接后返回完整正文。
+        首段（e_0）404 时返回 None，表示该端点格式对此书不适用。
+        """
+        parts: list[str] = []
+        for n in range(50):
+            got = False
+            for url in (
+                f"{_BASE_I}/book/chapter/e_{n}",
+                f"/web/book/chapter/e_{n}",
+            ):
+                try:
+                    resp = await self._get(
+                        url, bookId=book_id_param, chapterUid=chapter_uid
+                    )
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 404:
+                        _debug_log(
+                            f"404 from {url} bookId={book_id_param} "
+                            f"chapterUid={chapter_uid}"
+                        )
+                        continue
+                    raise
+
+                body: dict = resp.json()
+                _debug_log(
+                    f"Segment e_{n} from {url} bookId={book_id_param}: "
+                    f"keys={list(body.keys())[:5]}"
+                )
+
+                if (body.get("encrypt") or body.get("encryptType")
+                        or body.get("errCode") == -2010):
+                    raise DRMChapterError(
+                        f"章节 {chapter_uid} 已加密（DRM），无法在终端阅读"
+                    )
+
+                html: str | None = (
+                    body.get("data") or body.get("html") or body.get("content")
+                )
+                if html:
+                    parts.append(html)
+                    got = True
+                    break  # 该段成功，继续取下一段
+
+                _debug_log(f"Segment e_{n}: no content field, stopping")
+                break  # 200 但无正文，视为已无更多段
+
+            if not got:
+                if n == 0:
+                    return None  # e_0 不可用，此端点格式不适用
+                break  # 无更多段
+
+        return "".join(parts) if parts else None
+
+    async def get_chapter_content(self, book_id: str, chapter_uid: int) -> str:
+        """
+        获取章节正文 HTML。
+
+        回退策略（依次尝试）：
+          1. e3 端点 + 数字 bookId
+          2. e3 端点 + bookKey（encodeId）
+          3. e_N 分段端点 + 数字 bookId（新版书籍将章节拆成多段）
+          4. e_N 分段端点 + bookKey
+          5. Playwright browser fallback
+        """
+        # ---- 1. 数字 bookId，e3 格式 ----
+        html = await self._fetch_chapter_html(book_id, chapter_uid)
         if html is not None:
             return html
 
-        # browser 也失败，抛原始 404 错误（消息保留 "404" 供测试匹配）
-        raise DRMChapterError(
-            f"章节 {chapter_uid} 暂不可用（两个端点均返回 404，"
-            "可能为加密章节或该书不支持网页版阅读）"
-        ) from last_exc
-
-    async def _browser_fallback(self, book_id: str, chapter_uid: int) -> str | None:
-        """
-        尝试 Playwright browser fallback 获取章节正文。
-
-        先通过 get_book_info 获取 bookKey（用于构造阅读器 URL），
-        再调用 weread.browser.fetch_chapter_via_browser。
-        任何失败均静默降级：返回 None，调用方负责抛出 DRMChapterError。
-        """
-        # 尝试获取 bookKey（用于阅读器 URL；失败时回退 book_id）
+        # ---- 解析 bookKey（encodeId），供后续步骤复用 ----
         book_key: str | None = None
         try:
             info = await self.get_book_info(book_id)
-            book_key = info.get("bookKey") or None
+            book_key = info.get("encodeId") or None
             if book_key:
                 _debug_log(f"Resolved bookKey={book_key!r} for bookId={book_id}")
         except Exception as exc:
             _debug_log(f"get_book_info failed (bookId={book_id}): {exc}")
+
+        # ---- 2. bookKey，e3 格式 ----
+        if book_key and book_key != book_id:
+            _debug_log(f"Retrying with bookKey={book_key!r} (numeric bookId={book_id} returned 404)")
+            html = await self._fetch_chapter_html(book_key, chapter_uid)
+            if html is not None:
+                return html
+
+        # ---- 3. 数字 bookId，e_N 分段格式（新版书籍）----
+        html = await self._fetch_chapter_html_segmented(book_id, chapter_uid)
+        if html is not None:
+            _debug_log(f"Got chapter via segmented e_N (bookId={book_id})")
+            return html
+
+        # ---- 4. bookKey，e_N 分段格式 ----
+        if book_key and book_key != book_id:
+            html = await self._fetch_chapter_html_segmented(book_key, chapter_uid)
+            if html is not None:
+                _debug_log(f"Got chapter via segmented e_N (bookKey={book_key})")
+                return html
+
+        # ---- 5. browser fallback ----
+        _debug_log(
+            f"All HTTP endpoints returned 404 for bookId={book_id} bookKey={book_key} "
+            f"chapterUid={chapter_uid}; trying Playwright browser fallback"
+        )
+        html = await self._browser_fallback(book_id, chapter_uid, book_key=book_key)
+        if html is not None:
+            return html
+
+        raise DRMChapterError(
+            f"章节 {chapter_uid} 暂不可用（两个端点均返回 404，"
+            "可能为加密章节或该书不支持网页版阅读）"
+        )
+
+    async def _browser_fallback(
+        self, book_id: str, chapter_uid: int, *, book_key: str | None = None
+    ) -> str | None:
+        """
+        尝试 Playwright browser fallback 获取章节正文。
+        book_key 若已在上层解析，直接传入避免重复请求 get_book_info。
+        任何失败均静默降级：返回 None，调用方负责抛出 DRMChapterError。
+        """
+        if book_key is None:
+            try:
+                info = await self.get_book_info(book_id)
+                book_key = info.get("encodeId") or None
+                if book_key:
+                    _debug_log(f"Resolved bookKey={book_key!r} for bookId={book_id}")
+            except Exception as exc:
+                _debug_log(f"get_book_info failed (bookId={book_id}): {exc}")
 
         try:
             from weread.browser import BrowserFetchError, fetch_chapter_via_browser

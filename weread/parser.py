@@ -105,6 +105,10 @@ def _process_block(tag: Tag, parts: list[str]) -> None:
     elif name == "img":
         parts.append("[图片]")
 
+    elif name in ("style", "script", "head"):
+        # 不渲染样式/脚本/头部
+        pass
+
     else:
         # 未识别的块级标签：递归处理子节点
         for child in tag.children:

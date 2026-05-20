@@ -340,5 +340,119 @@ class TestGetChapterContent:
             client._client.get = AsyncMock(  # type: ignore
                 return_value=_make_response(status_code=404)
             )
+            client._browser_fallback = AsyncMock(return_value=None)  # type: ignore
             with pytest.raises(DRMChapterError, match="404"):
                 await client.get_chapter_content("3300054813", 315)
+
+    @pytest.mark.asyncio
+    async def test_retries_with_book_key_on_404(self):
+        """数字 bookId 两端点均 404 时，应用 get_book_info 返回的 bookKey 重试并成功。"""
+        html_content = "<p>通过 bookKey 获取的正文</p>"
+        side_effects = [
+            _make_response(status_code=404),               # i.weread.qq.com + 数字 bookId
+            _make_response(status_code=404),               # /web + 数字 bookId
+            _make_response({"encodeId": "71e32c00813ab7be9g013f0e"}),  # get_book_info
+            _make_response({"data": html_content}),        # i.weread.qq.com + bookKey → 成功
+        ]
+        # 在 async with 外保存 mock 引用，避免 aclose() 后 _client 变 None
+        mock_get = AsyncMock(side_effect=side_effects)
+        async with WeReadClient("v", "s") as client:
+            client._client.get = mock_get  # type: ignore
+            result = await client.get_chapter_content("3300054813", 315)
+        assert result == html_content
+        # 第 4 次调用（index 3）应使用 bookKey 而非数字 bookId
+        fourth_call_params = mock_get.call_args_list[3].kwargs["params"]
+        assert fourth_call_params["bookId"] == "71e32c00813ab7be9g013f0e"
+        assert fourth_call_params["chapterUid"] == 315
+
+    @pytest.mark.asyncio
+    async def test_skips_book_key_when_book_info_fails(self):
+        """get_book_info 请求失败时，直接跳过 bookKey 重试，进入 browser fallback。"""
+        async with WeReadClient("v", "s") as client:
+            # 所有 HTTP 请求均 404
+            client._client.get = AsyncMock(  # type: ignore
+                return_value=_make_response(status_code=404)
+            )
+            # browser fallback 返回 None（模拟 playwright 未安装）
+            client._browser_fallback = AsyncMock(return_value=None)  # type: ignore
+            with pytest.raises(DRMChapterError):
+                await client.get_chapter_content("3300054813", 315)
+        # browser_fallback 应被调用一次
+        client._browser_fallback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_browser_fallback_called_when_book_key_also_404(self):
+        """bookKey 重试也 404 时，应继续进入 browser fallback。"""
+        html_content = "<p>浏览器获取的正文</p>"
+        side_effects = [
+            _make_response(status_code=404),                          # i.weread.qq.com + 数字 bookId
+            _make_response(status_code=404),                          # /web + 数字 bookId
+            _make_response({"encodeId": "71e32c00813ab7be9g013f0e"}),  # get_book_info
+            _make_response(status_code=404),                          # i.weread.qq.com + bookKey
+            _make_response(status_code=404),                          # /web + bookKey
+        ]
+        async with WeReadClient("v", "s") as client:
+            client._client.get = AsyncMock(side_effect=side_effects)  # type: ignore
+            client._browser_fallback = AsyncMock(return_value=html_content)  # type: ignore
+            client._fetch_chapter_html_segmented = AsyncMock(return_value=None)  # type: ignore
+            result = await client.get_chapter_content("3300054813", 315)
+        assert result == html_content
+        # browser_fallback 调用时应传入已解析的 book_key，避免重复请求
+        call_kwargs = client._browser_fallback.call_args.kwargs
+        assert call_kwargs["book_key"] == "71e32c00813ab7be9g013f0e"
+
+
+# ---------------------------------------------------------------------------
+# _fetch_chapter_html（新辅助方法）
+# ---------------------------------------------------------------------------
+
+class TestFetchChapterHtml:
+    @pytest.mark.asyncio
+    async def test_returns_html_from_first_endpoint(self):
+        html = "<p>正文</p>"
+        async with WeReadClient("v", "s") as client:
+            client._client.get = AsyncMock(return_value=_make_response({"data": html}))  # type: ignore
+            result = await client._fetch_chapter_html("695233", 1)
+        assert result == html
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_second_endpoint(self):
+        """第一个端点 404 时自动尝试第二个端点。"""
+        html = "<p>来自 web 端点</p>"
+        side_effects = [
+            _make_response(status_code=404),
+            _make_response({"data": html}),
+        ]
+        async with WeReadClient("v", "s") as client:
+            client._client.get = AsyncMock(side_effect=side_effects)  # type: ignore
+            result = await client._fetch_chapter_html("695233", 1)
+        assert result == html
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_both_endpoints_404(self):
+        """两个端点均 404 时返回 None（由调用方决定后续策略）。"""
+        async with WeReadClient("v", "s") as client:
+            client._client.get = AsyncMock(  # type: ignore
+                return_value=_make_response(status_code=404)
+            )
+            result = await client._fetch_chapter_html("695233", 1)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_drm_on_encrypt_flag(self):
+        async with WeReadClient("v", "s") as client:
+            client._client.get = AsyncMock(  # type: ignore
+                return_value=_make_response({"encrypt": 1, "encryptType": "aes"})
+            )
+            with pytest.raises(DRMChapterError):
+                await client._fetch_chapter_html("b", 1)
+
+    @pytest.mark.asyncio
+    async def test_raises_drm_when_no_content_field(self):
+        """响应 200 但无 data/html/content 字段时，视为异常并抛出 DRMChapterError。"""
+        async with WeReadClient("v", "s") as client:
+            client._client.get = AsyncMock(  # type: ignore
+                return_value=_make_response({"chapterUid": 1, "status": "ok"})
+            )
+            with pytest.raises(DRMChapterError):
+                await client._fetch_chapter_html("b", 1)
